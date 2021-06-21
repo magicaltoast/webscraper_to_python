@@ -2,6 +2,9 @@ import json
 from collections import defaultdict
 from itertools import chain
 import re
+from base_classes import ClassGenerator, TypeHint, NameGenerator
+
+from additional_generators import ResultClassGenerator
 
 
 def split_name(name):
@@ -41,15 +44,21 @@ def process(input_dict):
             code = f'self.html.select("{selector["selector"]}")'
 
             if selector["type"] == "SelectorText":
-                res_type = "Iterator[str]"
+                res_type = TypeHint.string_iter()
                 code = f'map(attrgetter("text"), {code})'
             elif selector["type"] == "SelectorElementAttribute":
-                res_type = "Generator[str, None, None]"
+                res_type = TypeHint.string_iter()
                 code = f'map(itemgetter("{selector["extractAttribute"]}", {code}))'
             elif selector["type"] == "SelectorElement":
                 cls_name = to_class_name(selector["id"])
-                res_type = f"Iterator['{cls_name}']"
+                res_type = TypeHint("Iterator", cls_name, True)
                 code = f"map({cls_name}, {code})"
+            elif selector["type"] == "SelectorLink":
+                res_type = TypeHint.string_iter()
+                code = f'map(itemgetter("href", {code}))'
+            elif selector["type"] == "SelectorImage":
+                res_type = TypeHint.string_iter()
+                code = f'map(itemgetter("src", {code}))'
             else:
                 raise ValueError(selector)
         else:
@@ -59,19 +68,26 @@ def process(input_dict):
                 code = f'self.html.select_one("{selector["selector"]}")'
 
             if selector["type"] == "SelectorText":
-                res_type = "Optional[str]"
-                code += ".text"
+                res_type = TypeHint.optional_string()
+                code = f"None if (element := {code}) is None else element.text"
             elif selector["type"] == "SelectorElementAttribute":
-                res_type = "Optional[str]"
+                res_type = TypeHint.optional_string()
                 code += f'.get("{selector["extractAttribute"]}", None)'
+            elif selector["type"] == "SelectorLink":
+                res_type = TypeHint.optional_string()
+                code += '.get("href", None)'
+            elif selector["type"] == "SelectorImage":
+                res_type = TypeHint.optional_string()
+                code += '.get("src", None)'
             elif selector["type"] == "SelectorElement":
                 cls_name = to_class_name(selector["id"])
-                res_type = f"Optional['{cls_name}']"
+                res_type = TypeHint("Optional", cls_name, True)
                 code = f"None if (element := {code}) is None else {cls_name}(element)"
             else:
                 raise ValueError(selector)
 
         assert len(selector["parentSelectors"]) == 1
+
         if selector["id"] == "_id":
             result[selector["parentSelectors"][0]].append((code, root_name, res_type))
         else:
@@ -82,23 +98,33 @@ def process(input_dict):
     return result
 
 
-class ClassGenerator:
-    def __init__(self, name):
-        self.text = f"""class {name}:\n\tdef __init__(self, html: BeautifulSoup):\n\t\tself.html = html\n"""
-
-    def add_method(self, name, code, type_hint=None):
-        type_hint = "" if type_hint is None else f" -> {type_hint}"
-        self.text += f"\tdef {name}(self){type_hint}:\n\t\treturn {code}\n\n"
-
-
 def generate(name, values):
-    obj = ClassGenerator(to_class_name(name))
+    name_gen = NameGenerator()
+    obj = ClassGenerator(to_class_name(name), name_gen, additional_generators=[ResultClassGenerator])
 
     for code, function_name, typing in values:
         obj.add_method(to_function_name(function_name), code, typing)
 
     return obj
 
+
+# https://stackoverflow.com/questions/51286748/make-the-python-json-encoder-support-pythons-new-dataclasses
+JSON_ENCODER = """
+class EnhancedJSONEncoder(json.JSONEncoder):
+        def default(self, o):
+            if dataclasses.is_dataclass(o):
+                return dataclasses.asdict(o)
+            return super().default(o)\n\n"""
+
+IMPORTS = [
+    "from typing import Optional, Iterator, List",
+    "from bs4 import BeautifulSoup",
+    "from operator import attrgetter",
+    "from operator import methodcaller",
+    "from dataclasses import dataclass",
+    "import json",
+    "import dataclasses"
+]
 
 if __name__ == "__main__":
     import argparse
@@ -112,7 +138,9 @@ if __name__ == "__main__":
         input_json = json.load(i)
 
         with open(args["o"], "w+") as o:
-            o.write("\n\n\n".join([
-                "from typing import Optional, Iterator\nfrom bs4 import BeautifulSoup\nfrom operator import attrgetter",
-                *[generate(key, value).text for key, value in process(input_json).items()],
+            o.write("".join([
+                "\n".join(IMPORTS),
+                "\n\n",
+                JSON_ENCODER,
+                *[generate(key, value).serialize() for key, value in process(input_json).items()],
             ]))
